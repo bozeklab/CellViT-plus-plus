@@ -1,0 +1,16 @@
+wsi_filelist: ./birmingham_pn_cellvit_filelist.csv
+output_path: /home/agwiazda/birmingham_offline_patches
+wsi_extension: svs
+patch_size: 1024
+patch_overlap: 6.25
+downsample: 2
+processes: 1
+min_intersection_ratio: 0.05
+apply_prefilter: false
+filter_patches: false
+store_masks: false
+normalize_stains: false
+hardware_selection: openslide
+thumbnail_max_size: 512
+skip_background_mask: true
+log_level: info

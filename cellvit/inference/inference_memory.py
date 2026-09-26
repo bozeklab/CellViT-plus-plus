@@ -15,10 +15,13 @@ from pathlib import Path
 from typing import Union
 
 import pandas as pd
+import pathopatch.patch_extraction.dataset as pathopatch_dataset_module
 import ray
 import torch
 import tqdm
 import ujson
+import yaml
+from openslide import OpenSlide
 from cellvit.data.dataclass.cell_graph import CellGraphDataWSI
 from cellvit.data.dataclass.wsi import WSIMetadata
 from cellvit.inference.inference_disk import CellViTInference
@@ -33,6 +36,51 @@ from pathopatch.patch_extraction.dataset import (
 )
 import snappy
 from cellvit.inference.wsi_meta import load_wsi_meta
+
+
+def load_preprocessing_config(preprocessing_config: Union[Path, str, None]) -> dict:
+    """Load optional PathoPatch preprocessing overrides from YAML."""
+
+    if preprocessing_config is None:
+        return {}
+
+    config_path = Path(preprocessing_config)
+    with open(config_path, "r", encoding="utf-8") as config_file:
+        config = yaml.safe_load(config_file) or {}
+    if not isinstance(config, dict):
+        raise TypeError("Preprocessing config must contain a YAML mapping")
+    return config
+
+
+def generate_placeholder_masks() -> dict:
+    return {"mask_nogrid": None, "mask": None, "tissue_grid": None}
+
+
+def compute_all_patch_coordinates(
+    slide,
+    tiles,
+    target_level,
+    target_patch_size,
+    target_overlap,
+    tissue_annotation_intersection_ratio,
+    label_map,
+    rescaling_factor=1.0,
+    full_tile_size=2000,
+    polygons=None,
+    region_labels=None,
+    tissue_annotation=None,
+    mask_otsu=False,
+    otsu_annotation="object",
+    apply_prefilter=False,
+    fast_mode=False,
+):
+    n_cols, n_rows = tiles.level_tiles[target_level]
+    interesting_patches = [(row, col, 0.0) for row in range(n_rows) for col in range(n_cols)]
+    return interesting_patches, generate_placeholder_masks(), {}
+
+
+def should_skip_background_mask(preprocessing_overrides: dict) -> bool:
+    return bool(preprocessing_overrides.pop("skip_background_mask", False))
 
 
 class CellViTInferenceMemory(CellViTInference):
@@ -71,7 +119,8 @@ class CellViTInferenceMemory(CellViTInference):
         wsi_path: Union[Path, str],
         wsi_properties: dict = {},
         resolution: float = 0.25,
-        apply_prefilter: bool = True,
+        preprocessing_config: Union[Path, str, None] = None,
+        apply_prefilter: bool = False,
         filter_patches: bool = False,
         **kwargs,
     ) -> None:
@@ -82,7 +131,9 @@ class CellViTInferenceMemory(CellViTInference):
             wsi_properties (dict, optional): Optional WSI properties,
                 Allowed keys are 'slide_mpp' and 'magnification'. Defaults to {}.
             resolution (float, optional): Target resolution. Defaults to 0.25.
-            apply_prefilter (bool, optional): Prefilter. Defaults to True.
+            preprocessing_config (Union[Path, str, None], optional): Optional YAML
+                file with PathoPatch preprocessing overrides.
+            apply_prefilter (bool, optional): Prefilter. Defaults to False.
             filter_patches (bool, optional): Filter patches after processing. Defaults to False.
         """
         assert resolution in [0.25, 0.5], "Resolution must be one of [0.25, 0.5]"
@@ -95,6 +146,24 @@ class CellViTInferenceMemory(CellViTInference):
             logger=self.logger,
         )
 
+        preprocessing_overrides = load_preprocessing_config(preprocessing_config)
+        skip_background_mask = should_skip_background_mask(preprocessing_overrides)
+        controlled_fields = {
+            "wsi_path",
+            "wsi_properties",
+            "patch_size",
+            "patch_overlap",
+            "target_mpp",
+            "target_mpp_tolerance",
+            "apply_prefilter",
+            "filter_patches",
+        }
+        preprocessing_overrides = {
+            key: value
+            for key, value in preprocessing_overrides.items()
+            if key not in controlled_fields
+        }
+
         # setup wsi dataloader and postprocessor
         dataset_config = LivePatchWSIConfig(
             wsi_path=str(wsi_path),
@@ -105,15 +174,32 @@ class CellViTInferenceMemory(CellViTInference):
             apply_prefilter=apply_prefilter,
             filter_patches=filter_patches,
             target_mpp_tolerance=0.035,
+            **preprocessing_overrides,
             **kwargs,
         )
         wsi_path = Path(wsi_path)
 
-        wsi_inference_dataset = LivePatchWSIDataset(
-            slide_processor_config=dataset_config,
-            logger=self.logger,
-            transforms=self.inference_transforms,
-        )
+        original_compute_interesting_patches = None
+        if skip_background_mask:
+            self.logger.warning(
+                "Skipping PathoPatch full-slide background mask generation for live inference."
+            )
+            original_compute_interesting_patches = (
+                pathopatch_dataset_module.compute_interesting_patches
+            )
+            pathopatch_dataset_module.compute_interesting_patches = compute_all_patch_coordinates
+
+        try:
+            wsi_inference_dataset = LivePatchWSIDataset(
+                slide_processor_config=dataset_config,
+                logger=self.logger,
+                transforms=self.inference_transforms,
+            )
+        finally:
+            if original_compute_interesting_patches is not None:
+                pathopatch_dataset_module.compute_interesting_patches = (
+                    original_compute_interesting_patches
+                )
         wsi_inference_dataloader = LivePatchWSIDataloader(
             dataset=wsi_inference_dataset, batch_size=self.batch_size, shuffle=False
         )
@@ -135,19 +221,33 @@ class CellViTInferenceMemory(CellViTInference):
         )
 
         # create ray actors for batch-wise postprocessing
+        self._initialize_ray()
         batch_pooling_actors = [
             BatchPoolingActor.remote(postprocessor, self.run_conf)
             for i in range(self.ray_actors)
         ]
 
         call_ids = []
+        inference_results = []
 
         self.logger.info("Extracting cells using CellViT...")
         with torch.no_grad():
-            pbar = tqdm.tqdm(
-                wsi_inference_dataloader, total=len(wsi_inference_dataloader)
-            )
-            for batch_num, batch in enumerate(wsi_inference_dataloader):
+            total_batches = len(wsi_inference_dataloader)
+            batch_iterator = iter(wsi_inference_dataloader)
+            pbar = tqdm.tqdm(total=total_batches)
+            batch_num = 0
+            while True:
+                try:
+                    batch = next(batch_iterator)
+                except StopIteration:
+                    break
+                except IndexError:
+                    self.logger.warning(
+                        "PathoPatcher returned an empty batch during WSI iteration; skipping iterator step."
+                    )
+                    continue
+                if not isinstance(batch[0], torch.Tensor) or batch[0].numel() == 0:
+                    continue
                 patches = batch[0].to(self.device)
                 metadata = batch[1]
                 batch_actor = batch_pooling_actors[batch_num % self.ray_actors]
@@ -162,11 +262,12 @@ class CellViTInferenceMemory(CellViTInference):
                     predictions, metadata
                 )
                 call_ids.append(call_id)
+                call_ids = self._drain_ray_tasks(call_ids, inference_results)
                 pbar.update(1)
-                pbar.total = len(wsi_inference_dataloader)
+                batch_num += 1
 
             self.logger.info("Waiting for final batches to be processed...")
-            inference_results = [ray.get(call_id) for call_id in call_ids]
+            self._drain_ray_tasks(call_ids, inference_results, drain_all=True)
         del pbar
         [ray.kill(batch_actor) for batch_actor in batch_pooling_actors]
 
@@ -221,6 +322,15 @@ class CellViTInferenceMemory(CellViTInference):
                 rescaling_factor=wsi.metadata["target_patch_mpp"]
                 / wsi.metadata["base_mpp"],
             )
+
+        # Coordinates are level-0 pixels relative to the non-empty slide region (PathoPatch
+        # tiles with limit_bounds=True). Store that region's offset so consumers can add it.
+        slide_props = OpenSlide(str(wsi_path)).properties
+        wsi.metadata["coordinate_frame"] = "level0_relative_to_bounds"
+        wsi.metadata["level0_offset_xy"] = [
+            int(slide_props.get("openslide.bounds-x", 0)),
+            int(slide_props.get("openslide.bounds-y", 0)),
+        ]
 
         # saving/storing
         output_wsi_name = wsi_path.name.split(".")[0]

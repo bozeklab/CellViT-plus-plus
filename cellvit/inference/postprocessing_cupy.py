@@ -580,7 +580,7 @@ class DetectionCellPostProcessorCupy:
         return int(inst_type), float(type_prob)
 
 
-@ray.remote(num_cpus=8, num_gpus=0.1)
+@ray.remote(num_cpus=1, num_gpus=0.1)
 class BatchPoolingActor:
     def __init__(
         self,
@@ -721,14 +721,18 @@ class BatchPoolingActor:
             "nuclei_types"
         ]
 
-        wsi_scaling_factor = wsi.metadata["downsampling"]
+        # Offsets are in the pixel frame of the patches that were read (the pyramid level at
+        # target_patch_mpp), like the cell positions inside a patch. Do not multiply by
+        # wsi.metadata["downsampling"]: _reallign_grid rescales every coordinate to level 0
+        # afterwards, so scaling here too applied the downsampling twice to tile positions
+        # (and not to positions inside a tile) whenever downsampling != 1.
         patch_size = wsi.metadata["patch_size"]
         x_global = int(
-            patch_metadata["row"] * patch_size * wsi_scaling_factor
+            patch_metadata["row"] * patch_size
             - (patch_metadata["row"] + 0.5) * wsi.metadata["patch_overlap"]
         )
         y_global = int(
-            patch_metadata["col"] * patch_size * wsi_scaling_factor
+            patch_metadata["col"] * patch_size
             - (patch_metadata["col"] + 0.5) * wsi.metadata["patch_overlap"]
         )
 

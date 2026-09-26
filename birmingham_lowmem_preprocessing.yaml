@@ -1,0 +1,7 @@
+min_intersection_ratio: 0.05
+apply_prefilter: false
+filter_patches: false
+store_masks: false
+normalize_stains: false
+masked_otsu: false
+skip_background_mask: true

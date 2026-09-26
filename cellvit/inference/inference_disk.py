@@ -11,6 +11,7 @@
 # Institute for Artifical Intelligence in Medicine,
 # University Medicine Essen
 
+import getpass
 import os
 import sys
 import uuid
@@ -164,6 +165,7 @@ class CellViTInference:
         self.model_arch: str
         self.num_workers: int
         self.ray_actors: int
+        self.ray_init_kwargs: dict = {}
 
         # hand over parameters
         self.model_path = Path(model_path)
@@ -370,22 +372,86 @@ class CellViTInference:
                 "mixed_precision", False
             )
 
+    @staticmethod
+    def _get_available_cpus() -> int:
+        """Number of CPUs this process is actually allowed to use.
+
+        os.cpu_count() reports the CPUs of the whole node, which massively
+        overcommits the job when running inside a Slurm/cgroup allocation.
+
+        Returns:
+            int: Number of usable CPUs, at least 1.
+        """
+        if "SLURM_CPUS_PER_TASK" in os.environ:
+            return max(1, int(os.environ["SLURM_CPUS_PER_TASK"]))
+        if hasattr(os, "sched_getaffinity"):
+            return max(1, len(os.sched_getaffinity(0)))
+        return max(1, os.cpu_count() or 1)
+
     def _setup_worker(self) -> None:
         """Setup the worker for inference"""
+        available_cpus = self._get_available_cpus()
+
+        # Postprocessing actors are long-living, so ray must be able to place
+        # all of them at once - otherwise the pending actors deadlock ray.get()
+        self.ray_actors = int(np.clip(1 / 2 * self.batch_size, 4, 8))
+        self.ray_actors = int(min(self.ray_actors, max(2, available_cpus)))
+
         runtime_env = {
             "env_vars": {
                 "PYTHONPATH": project_root
             }
         }
-        ray.init(num_cpus=os.cpu_count() - 2, runtime_env=runtime_env)
+        self.ray_init_kwargs = {
+            "num_cpus": max(available_cpus, self.ray_actors + 1),
+            "runtime_env": runtime_env,
+            "include_dashboard": False,
+        }
+        # /tmp is shared between jobs on a cluster node, so every job needs its
+        # own (short) session directory or the raylet fails to register workers
+        if "SLURM_JOB_ID" in os.environ:
+            temp_dir = os.path.join(
+                "/tmp",
+                os.environ.get("USER", getpass.getuser()),
+                f"ray_{os.environ['SLURM_JOB_ID']}",
+            )
+            os.makedirs(temp_dir, exist_ok=True)
+            self.ray_init_kwargs["_temp_dir"] = temp_dir
+
         # workers for loading data
-        num_workers = int(3 / 4 * os.cpu_count())
-        if num_workers is None:
-            num_workers = 16
-        num_workers = int(np.clip(num_workers, 1, 4 * self.batch_size))
+        num_workers = int(np.clip(available_cpus - 1, 1, 4 * self.batch_size))
         self.num_workers = num_workers
-        self.ray_actors = int(np.clip(1 / 2 * self.batch_size, 4, 8))
-        self.logger.info(f"Using {self.ray_actors} ray-workers")
+        self.logger.info(
+            f"Detected {available_cpus} usable CPUs - using {self.ray_actors} "
+            f"ray-workers and {self.num_workers} dataloader-workers"
+        )
+
+    def _initialize_ray(self) -> None:
+        """Start Ray only when batch postprocessing is about to begin."""
+
+        if not ray.is_initialized():
+            ray.init(**self.ray_init_kwargs)
+
+    def _drain_ray_tasks(
+        self,
+        pending_call_ids: list,
+        inference_results: list,
+        drain_all: bool = False,
+    ) -> list:
+        """Keep only a bounded number of Ray tasks in flight.
+
+        Ray stores task inputs and outputs until they are retrieved. On large
+        slides, collecting every batch result only at the end can exhaust host
+        memory and kill the local GCS process. Drain incrementally instead.
+        """
+
+        max_pending_tasks = 0 if drain_all else self.ray_actors
+        while len(pending_call_ids) > max_pending_tasks:
+            ready_call_ids, pending_call_ids = ray.wait(
+                pending_call_ids, num_returns=1
+            )
+            inference_results.extend(ray.get(ready_call_ids))
+        return pending_call_ids
 
     def process_wsi(
         self,
@@ -428,11 +494,13 @@ class CellViTInference:
         )
 
         # create ray actors for batch-wise postprocessing
+        self._initialize_ray()
         batch_pooling_actors = [
             BatchPoolingActor.remote(postprocessor, self.run_conf)
             for i in range(self.ray_actors)
         ]
         call_ids = []
+        inference_results = []
 
         with torch.no_grad():
             pbar = tqdm.tqdm(
@@ -453,10 +521,11 @@ class CellViTInference:
                     predictions, metadata
                 )
                 call_ids.append(call_id)
+                call_ids = self._drain_ray_tasks(call_ids, inference_results)
                 pbar.update(1)
 
             self.logger.info("Waiting for final batches to be processed...")
-            inference_results = [ray.get(call_id) for call_id in call_ids]
+            self._drain_ray_tasks(call_ids, inference_results, drain_all=True)
         del pbar
         [ray.kill(batch_actor) for batch_actor in batch_pooling_actors]
 

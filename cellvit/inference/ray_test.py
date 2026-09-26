@@ -53,7 +53,11 @@ def main():
     }
     
     try:
-        ray.init(runtime_env=runtime_env)
+        ray.init(
+            runtime_env=runtime_env,
+            num_cpus=int(os.environ.get("SLURM_CPUS_PER_TASK", 4)),
+            _temp_dir=f"/tmp/{os.environ['USER']}/ray_{os.environ['SLURM_JOB_ID']}",
+        )
         log_message("\nRay initialized successfully.")
     except Exception as e:
         log_message(f"Error initializing Ray: {str(e)}", level="ERROR")

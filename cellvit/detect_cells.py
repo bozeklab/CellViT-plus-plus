@@ -45,6 +45,7 @@ def main():
             wsi_path=wsi_path,
             wsi_properties=args.get("wsi_properties", {}),
             resolution=args["resolution"],
+            preprocessing_config=args.get("preprocessing_config"),
         )
 
     elif command.lower() == "process_dataset":
@@ -66,6 +67,7 @@ def main():
                     wsi_path=wsi_path,
                     wsi_properties=wsi_properties,
                     resolution=args["resolution"],
+                    preprocessing_config=args.get("preprocessing_config"),
                 )
 
         elif args["wsi_folder"] is not None:
@@ -81,15 +83,21 @@ def main():
             for wsi_index, wsi in enumerate(wsi_filelist):
                 celldetector.logger.info(f"Progress: {wsi_index+1}/{len(wsi_filelist)}")
                 wsi_path = Path(wsi)
-                wsi_properties = {}
-                # if "slide_mpp" in wsi:
-                #     wsi_properties["slide_mpp"] = wsi["slide_mpp"]
-                # if "magnification" in wsi:
-                #     wsi_properties["magnification"] = wsi["magnification"]
+                # Resumable: skip slides whose outputs are already written (same naming as
+                # process_wsi), so a resubmitted job continues where the last one stopped.
+                stem = wsi_path.name.split(".")[0]
+                if all(
+                    (Path(args["outdir"]) / f"{stem}{suffix}").is_file()
+                    for suffix in ("_cells.json", "_cell_detection.json")
+                ):
+                    celldetector.logger.info(f"Skipping {wsi_path.name}: outputs exist")
+                    continue
+                wsi_properties = args.get("wsi_properties") or {}
                 celldetector.process_wsi(
                     wsi_path=wsi_path,
                     wsi_properties=wsi_properties,
                     resolution=args["resolution"],
+                    preprocessing_config=args.get("preprocessing_config"),
                 )
         else:
             raise ValueError("Provide either filelist or wsi_folder.")

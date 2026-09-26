@@ -8,6 +8,7 @@
 
 from typing import Tuple
 import logging
+import re
 from openslide import OpenSlide
 from pathlib import Path
 
@@ -45,7 +46,7 @@ def load_wsi_meta(
         try:
             pattern = re.compile(r"MPP(?: =)? (\d+\.\d+)")
             # Use the pattern to find the match in the string
-            match = pattern.search(self.slide_openslide.properties["openslide.comment"])
+            match = pattern.search(slide_openslide.properties["openslide.comment"])
             # Extract the float value
             if match:
                 slide_mpp = float(match.group(1))
@@ -87,6 +88,13 @@ def load_wsi_meta(
         elif slide_mpp >= 0.20 and slide_mpp <= 0.30:
             target_mpp = slide_mpp
             logger.info(f"Using target_mpp: {target_mpp} instead of {resolution}")
+        elif slide_mpp >= 0.10 and slide_mpp <= 0.15:
+            # Native pyramid level one step down is at ~0.25 um/px: read it as stored.
+            target_mpp = slide_mpp * 2
+            logger.info(
+                f"Using target_mpp: {target_mpp} (pyramid level 1 of a {slide_mpp} um/px slide) "
+                f"instead of {resolution}"
+            )
         else:
             target_mpp = resolution
             logger.warning(

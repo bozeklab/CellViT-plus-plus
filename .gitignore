@@ -38,6 +38,7 @@ cufile.log
 # local testing and checkpoints
 /logs_local
 /logs/Head-Evaluation
+/job_logs
 
 # shell scripts for automation
 /runtime-scripts

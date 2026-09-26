@@ -139,6 +139,12 @@ class InferenceWSIParser:
             default="svs",
         )
         subparser_dataset.add_argument(
+            "--wsi_properties",
+            type=parse_wsi_properties,
+            help="WSI Metadata applied to every WSI of the folder, fields are slide_mpp and magnification. Provide as JSON string. "
+            "Only used together with --wsi_folder, for --filelist the csv columns take precedence.",
+        )
+        subparser_dataset.add_argument(
             "--preprocessing_config",
             type=str,
             help="Path to a .yaml file containing preprocessing configurations, optional",
